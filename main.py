@@ -1,6 +1,6 @@
 """
-ListinGenius API Backend - Full Version
-Real video generation with Higgsfield Kling 3.0
+ListinGenius API Backend
+Video generation with official Higgsfield SDK
 Text generation with Claude AI
 """
 
@@ -8,8 +8,6 @@ import os
 import json
 import uuid
 import asyncio
-import base64
-import time
 from datetime import datetime
 from typing import Optional, List
 from contextlib import asynccontextmanager
@@ -17,8 +15,6 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
 
@@ -54,7 +50,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ListinGenius API",
     description="AI-Powered Real Estate Video Generation",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -65,10 +61,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Static files
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 # ═══════════════════════════════════════════════════════════════
 # MODELS
@@ -85,18 +77,14 @@ class ListingDetails(BaseModel):
     style: str = "cinematic"
     director_notes: Optional[str] = None
 
-class GenerationRequest(BaseModel):
-    listing: ListingDetails
-    photo_urls: List[str]
-
 # ═══════════════════════════════════════════════════════════════
-# HIGGSFIELD CLIENT - Kling 3.0 Video Generation
+# HIGGSFIELD CLIENT - Using Official API Format
 # ═══════════════════════════════════════════════════════════════
 
 class HiggsFieldClient:
-    """Client for Higgsfield AI API - Kling 3.0 Video Generation"""
+    """Client for Higgsfield AI API using official SDK format"""
     
-    BASE_URL = "https://api.higgsfield.ai/v1"
+    BASE_URL = "https://platform.higgsfield.ai"
     
     def __init__(self):
         self.api_key = HF_API_KEY
@@ -104,9 +92,10 @@ class HiggsFieldClient:
         
     @property
     def headers(self):
+        # Format credentials as expected by Higgsfield
+        credentials = f"{self.api_key}:{self.api_secret}"
         return {
-            "Authorization": f"Bearer {self.api_key}",
-            "X-API-Secret": self.api_secret,
+            "Authorization": f"Bearer {credentials}",
             "Content-Type": "application/json"
         }
     
@@ -114,92 +103,70 @@ class HiggsFieldClient:
     def is_configured(self):
         return bool(self.api_key and self.api_secret)
     
-    async def upload_image(self, image_data: bytes, filename: str = "image.jpg") -> str:
-        """Upload image to Higgsfield and get URL for video generation"""
-        if not self.is_configured:
-            raise Exception("Higgsfield API not configured")
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # Get presigned upload URL
-            response = await client.post(
-                f"{self.BASE_URL}/uploads",
-                headers=self.headers,
-                json={
-                    "filename": filename,
-                    "content_type": "image/jpeg"
-                }
-            )
-            
-            if response.status_code != 200:
-                raise Exception(f"Failed to get upload URL: {response.status_code} - {response.text}")
-            
-            data = response.json()
-            upload_url = data.get("upload_url")
-            file_url = data.get("file_url") or data.get("url")
-            
-            # Upload the actual file
-            upload_response = await client.put(
-                upload_url,
-                content=image_data,
-                headers={"Content-Type": "image/jpeg"}
-            )
-            
-            if upload_response.status_code not in [200, 201]:
-                raise Exception(f"Failed to upload image: {upload_response.status_code}")
-            
-            return file_url
-    
     async def generate_video(
         self,
         image_url: str,
         prompt: str,
         aspect_ratio: str = "9:16",
-        duration: int = 5
     ) -> dict:
-        """Generate video using Kling 3.0"""
+        """Generate video using Higgsfield Kling model"""
         if not self.is_configured:
             raise Exception("Higgsfield API not configured")
         
         async with httpx.AsyncClient(timeout=600.0) as client:
-            # Start video generation
+            # Use Kling image-to-video model
             payload = {
-                "model": "kling-v1",  # Kling 3.0
                 "input": {
                     "image_url": image_url,
                     "prompt": prompt,
                     "aspect_ratio": aspect_ratio,
-                    "duration": duration,
-                    "cfg_scale": 0.5,
-                    "mode": "standard"
+                    "duration": 5
                 }
             }
             
             print(f"   Starting video generation: {aspect_ratio}")
+            print(f"   Using model: kling/v1.6/pro/image-to-video")
             
+            # Submit the job
             response = await client.post(
-                f"{self.BASE_URL}/generations",
+                f"{self.BASE_URL}/kling/v1.6/pro/image-to-video",
                 headers=self.headers,
                 json=payload
             )
             
-            if response.status_code != 200:
-                raise Exception(f"Failed to start generation: {response.status_code} - {response.text}")
+            print(f"   Response status: {response.status_code}")
             
-            generation = response.json()
-            generation_id = generation.get("id")
+            if response.status_code not in [200, 201, 202]:
+                error_text = response.text
+                print(f"   Error: {error_text}")
+                raise Exception(f"API error {response.status_code}: {error_text}")
             
-            print(f"   Generation ID: {generation_id}")
+            result = response.json()
+            request_id = result.get("request_id")
             
-            # Poll for completion (max 10 minutes)
+            if not request_id:
+                print(f"   Full response: {result}")
+                # Check if video is already ready
+                if result.get("video", {}).get("url"):
+                    return {
+                        "status": "completed",
+                        "video_url": result["video"]["url"]
+                    }
+                raise Exception("No request_id in response")
+            
+            print(f"   Request ID: {request_id}")
+            
+            # Poll for completion
             for attempt in range(120):
                 await asyncio.sleep(5)
                 
                 status_response = await client.get(
-                    f"{self.BASE_URL}/generations/{generation_id}",
+                    f"{self.BASE_URL}/requests/{request_id}/status",
                     headers=self.headers
                 )
                 
                 if status_response.status_code != 200:
+                    print(f"   Status check failed: {status_response.status_code}")
                     continue
                 
                 status_data = status_response.json()
@@ -207,16 +174,14 @@ class HiggsFieldClient:
                 
                 print(f"   Status: {status} (attempt {attempt + 1})")
                 
-                if status == "completed" or status == "succeeded":
-                    video_url = status_data.get("output", {}).get("video_url")
-                    if not video_url:
-                        video_url = status_data.get("video_url")
+                if status == "completed":
+                    video_url = status_data.get("video", {}).get("url")
                     return {
                         "status": "completed",
                         "video_url": video_url,
-                        "generation_id": generation_id
+                        "request_id": request_id
                     }
-                elif status == "failed" or status == "error":
+                elif status in ["failed", "error"]:
                     error = status_data.get("error", "Unknown error")
                     raise Exception(f"Generation failed: {error}")
             
@@ -245,7 +210,7 @@ Bedrooms: {listing.bedrooms} | Bathrooms: {listing.bathrooms}
 Square Feet: {listing.sqft or 'Not specified'}
 Key Features: {', '.join(listing.features) if listing.features else 'Modern updates throughout'}
 Style/Vibe: {listing.style}
-{f"Director's Notes: {listing.director_notes}" if listing.director_notes else ""}
+{f"Special Notes: {listing.director_notes}" if listing.director_notes else ""}
 
 Write 2-3 engaging paragraphs (150-200 words):
 - Hook them in the first sentence
@@ -288,7 +253,7 @@ Step inside to discover an open-concept layout bathed in natural light, featurin
 Located in a highly sought-after neighborhood, this home represents an incredible opportunity for discerning buyers. Schedule your private showing today – properties like this don't last long!"""
 
 
-async def generate_social_posts_with_claude(listing: ListingDetails, description: str) -> dict:
+async def generate_social_posts_with_claude(listing: ListingDetails) -> dict:
     """Generate social media posts using Claude"""
     
     default_posts = generate_fallback_social_posts(listing)
@@ -308,7 +273,7 @@ Create posts for each platform. Return ONLY valid JSON:
 {{
   "instagram": "engaging post with emojis and 5-8 relevant hashtags",
   "facebook": "longer post with call to action",
-  "tiktok": "short, trendy caption with hashtags",
+  "tiktok": "short punchy caption with hashtags",
   "twitter": "compelling tweet under 280 chars",
   "youtube": "video description with keywords"
 }}
@@ -333,7 +298,6 @@ JSON only, no markdown or explanation:"""
             if response.status_code == 200:
                 data = response.json()
                 text = data["content"][0]["text"].strip()
-                # Extract JSON
                 import re
                 json_match = re.search(r'\{[\s\S]*\}', text)
                 if json_match:
@@ -351,11 +315,11 @@ def generate_fallback_social_posts(listing: ListingDetails) -> dict:
     specs = f"{listing.bedrooms}BD/{listing.bathrooms}BA"
     
     return {
-        "instagram": f"✨ JUST LISTED ✨\n\n📍 {addr}\n💰 {price}\n🏠 {specs}\n\nYour dream home awaits! This stunning {listing.property_type.lower()} has everything you've been searching for.\n\n📲 Link in bio for full tour!\n\n#JustListed #RealEstate #DreamHome #HomeForSale #LuxuryListing #NewListing #HouseHunting #{listing.property_type.replace(' ', '')}",
-        "facebook": f"🏠 NEW LISTING ALERT!\n\n{addr}\n{price} | {specs}\n\nI'm thrilled to present this beautiful {listing.property_type.lower()} to the market!\n\nThis home features everything today's buyers are looking for. Don't miss your chance to own this incredible property.\n\n📞 Contact me today for a private showing!\n\n#JustListed #RealEstate",
-        "tiktok": f"POV: You just found your dream home 🏡✨ {price} | {specs} | Wait for the kitchen reveal 👀 #realestate #housetour #dreamhome #justlisted #hometour #fyp #viral",
-        "twitter": f"🏡 Just Listed: {addr}\n\n{price} | {specs}\n\nStunning {listing.property_type.lower()} with incredible features!\n\nDM for details 📩\n\n#RealEstate #JustListed",
-        "youtube": f"{addr} | Full Home Tour | {price} | {listing.bedrooms} Bed {listing.bathrooms} Bath\n\nWelcome to this incredible {listing.property_type.lower()}! In this video, I'll take you on a complete tour of this stunning property.\n\n🏠 Property Highlights:\n- {listing.bedrooms} Bedrooms, {listing.bathrooms} Bathrooms\n- {listing.sqft or 'Spacious'} Square Feet\n- Prime Location\n\n📞 Contact me for a private showing!\n\n#RealEstate #HomeTour #JustListed #LuxuryHome"
+        "instagram": f"✨ JUST LISTED ✨\n\n📍 {addr}\n💰 {price}\n🏠 {specs}\n\nYour dream home awaits! This stunning {listing.property_type.lower()} has everything you've been searching for.\n\n📲 Link in bio for full tour!\n\n#JustListed #RealEstate #DreamHome #HomeForSale #LuxuryListing",
+        "facebook": f"🏠 NEW LISTING ALERT!\n\n{addr}\n{price} | {specs}\n\nI'm thrilled to present this beautiful {listing.property_type.lower()} to the market!\n\n📞 Contact me today for a private showing!",
+        "tiktok": f"POV: You just found your dream home 🏡✨ {price} | {specs} #realestate #housetour #dreamhome #justlisted #fyp",
+        "twitter": f"🏡 Just Listed: {addr}\n\n{price} | {specs}\n\nStunning {listing.property_type.lower()}!\n\nDM for details 📩",
+        "youtube": f"{addr} | Full Home Tour | {price} | {listing.bedrooms} Bed {listing.bathrooms} Bath\n\nWelcome to this incredible {listing.property_type.lower()}!"
     }
 
 # ═══════════════════════════════════════════════════════════════
@@ -365,42 +329,52 @@ def generate_fallback_social_posts(listing: ListingDetails) -> dict:
 def build_video_prompt(listing: ListingDetails, format_type: str) -> str:
     """Build optimized prompt for video generation"""
     
-    # Base style prompts
     style_prompts = {
-        "cinematic": "Smooth cinematic camera movement, professional real estate showcase, warm golden hour lighting, elegant and inviting atmosphere",
-        "luxury": "Prestigious slow reveal, luxury real estate tour, sophisticated lighting, high-end architectural showcase, aspirational lifestyle",
-        "modern": "Clean contemporary movement, modern architectural focus, minimalist aesthetic, abundant natural light, sleek design showcase",
-        "cozy": "Warm gentle floating movement, inviting home atmosphere, soft natural lighting, comfortable family living, welcoming spaces",
-        "dramatic": "Bold dynamic camera sweep, striking architectural reveal, dramatic lighting contrast, impressive statement spaces"
+        "cinematic": "Smooth cinematic camera movement, professional real estate showcase, warm golden hour lighting",
+        "luxury": "Prestigious slow reveal, luxury real estate tour, sophisticated lighting",
+        "modern": "Clean contemporary movement, modern architectural focus, minimalist aesthetic",
+        "cozy": "Warm gentle floating movement, inviting home atmosphere, soft natural lighting",
+        "dramatic": "Bold dynamic camera sweep, striking architectural reveal, dramatic lighting"
     }
     
-    # Format-specific additions
-    format_additions = {
-        "vertical": "vertical composition optimized for mobile viewing, TikTok and Instagram Reels style",
-        "square": "square composition for social media feed, Instagram and Facebook optimized",
-        "landscape": "cinematic widescreen composition, YouTube and MLS presentation quality"
-    }
-    
-    # Build the prompt
     base_style = style_prompts.get(listing.style, style_prompts["cinematic"])
-    format_style = format_additions.get(format_type, "")
     
     prompt_parts = [
         base_style,
-        format_style,
         f"showcasing a beautiful {listing.property_type.lower()}",
-        f"${listing.price:,.0f} property"
     ]
     
-    # Add director's notes if provided
     if listing.director_notes:
         prompt_parts.append(listing.director_notes)
     
-    # Add feature highlights
-    if listing.features:
-        prompt_parts.append(f"highlighting {', '.join(listing.features[:2])}")
-    
     return ", ".join(prompt_parts)
+
+# ═══════════════════════════════════════════════════════════════
+# IMAGE UPLOAD HELPER
+# ═══════════════════════════════════════════════════════════════
+
+async def upload_image_to_public_url(image_path: str) -> str:
+    """Upload image and get a public URL for Higgsfield"""
+    # For now, we'll use a free image hosting service
+    # In production, use your own S3 bucket or similar
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        with open(image_path, "rb") as f:
+            files = {"file": f}
+            response = await client.post(
+                "https://tmpfiles.org/api/v1/upload",
+                files=files
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                # Convert tmpfiles URL to direct link
+                url = data.get("data", {}).get("url", "")
+                if url:
+                    # Convert https://tmpfiles.org/123/image.jpg to https://tmpfiles.org/dl/123/image.jpg
+                    return url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+    
+    raise Exception("Failed to upload image")
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN GENERATION PIPELINE
@@ -425,67 +399,67 @@ async def process_listing_job(job_id: str, listing: ListingDetails, image_paths:
         
         # Step 2: Generate social posts (15-25%)
         job["message"] = "Creating social media posts..."
-        social_posts = await generate_social_posts_with_claude(listing, description)
+        social_posts = await generate_social_posts_with_claude(listing)
         job["social_posts"] = social_posts
         job["progress"] = 25
         print(f"   ✅ Social posts generated")
         
-        # Step 3: Upload primary image (25-35%)
-        job["message"] = "Preparing image for video generation..."
-        
-        if not hf_client.is_configured:
-            raise Exception("Video generation API not configured. Please add HF_API_KEY and HF_API_SECRET.")
-        
-        # Use the first image for video generation
-        primary_image_path = image_paths[0]
-        with open(primary_image_path, "rb") as f:
-            image_data = f.read()
-        
-        image_url = await hf_client.upload_image(image_data, Path(primary_image_path).name)
-        job["progress"] = 35
-        print(f"   ✅ Image uploaded: {image_url[:50]}...")
-        
-        # Step 4: Generate videos in all 3 formats (35-95%)
-        job["message"] = "Generating cinematic videos..."
-        
-        formats = [
-            ("vertical", "9:16"),
-            ("square", "1:1"),
-            ("landscape", "16:9")
-        ]
-        
+        # Step 3: Upload image and generate videos (25-95%)
         videos = {}
-        progress_per_video = 20  # ~60% total for 3 videos
         
-        for i, (format_name, aspect_ratio) in enumerate(formats):
-            job["message"] = f"Rendering {format_name} video ({i+1}/3)..."
-            
-            prompt = build_video_prompt(listing, format_name)
-            print(f"   🎥 Generating {format_name} video...")
-            print(f"      Prompt: {prompt[:100]}...")
-            
+        if hf_client.is_configured and image_paths:
             try:
-                result = await hf_client.generate_video(
-                    image_url=image_url,
-                    prompt=prompt,
-                    aspect_ratio=aspect_ratio,
-                    duration=5
-                )
-                videos[format_name] = {
-                    "url": result.get("video_url"),
-                    "status": "completed",
-                    "generation_id": result.get("generation_id")
-                }
-                print(f"   ✅ {format_name} video completed")
+                job["message"] = "Uploading image..."
+                job["progress"] = 30
+                
+                # Upload the first image
+                image_url = await upload_image_to_public_url(image_paths[0])
+                print(f"   ✅ Image uploaded: {image_url[:50]}...")
+                
+                # Generate videos in different formats
+                formats = [
+                    ("vertical", "9:16"),
+                    ("square", "1:1"),
+                    ("landscape", "16:9")
+                ]
+                
+                progress_per_video = 20
+                
+                for i, (format_name, aspect_ratio) in enumerate(formats):
+                    job["message"] = f"Generating {format_name} video ({i+1}/3)..."
+                    
+                    prompt = build_video_prompt(listing, format_name)
+                    print(f"   🎥 Generating {format_name} video...")
+                    
+                    try:
+                        result = await hf_client.generate_video(
+                            image_url=image_url,
+                            prompt=prompt,
+                            aspect_ratio=aspect_ratio
+                        )
+                        videos[format_name] = {
+                            "url": result.get("video_url"),
+                            "status": "completed"
+                        }
+                        print(f"   ✅ {format_name} video completed")
+                    except Exception as e:
+                        print(f"   ❌ {format_name} video failed: {e}")
+                        videos[format_name] = {
+                            "url": None,
+                            "status": "failed",
+                            "error": str(e)
+                        }
+                    
+                    job["progress"] = 35 + (progress_per_video * (i + 1))
+                    
             except Exception as e:
-                print(f"   ❌ {format_name} video failed: {e}")
-                videos[format_name] = {
-                    "url": None,
-                    "status": "failed",
-                    "error": str(e)
-                }
-            
-            job["progress"] = 35 + (progress_per_video * (i + 1))
+                print(f"   ❌ Video generation error: {e}")
+                for fmt in ["vertical", "square", "landscape"]:
+                    videos[fmt] = {"status": "failed", "error": str(e), "url": None}
+        else:
+            # No video API configured
+            for fmt in ["vertical", "square", "landscape"]:
+                videos[fmt] = {"status": "not_configured", "url": None}
         
         # Complete
         job["videos"] = videos
@@ -494,7 +468,7 @@ async def process_listing_job(job_id: str, listing: ListingDetails, image_paths:
         job["message"] = "Your listing package is ready!"
         job["completed_at"] = datetime.now().isoformat()
         
-        print(f"✅ Job {job_id} completed successfully!")
+        print(f"✅ Job {job_id} completed!")
         
     except Exception as e:
         job["status"] = "failed"
@@ -510,7 +484,7 @@ async def process_listing_job(job_id: str, listing: ListingDetails, image_paths:
 async def root():
     return {
         "service": "ListinGenius API",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "status": "running",
         "capabilities": {
             "video_generation": hf_client.is_configured,
@@ -530,19 +504,6 @@ async def health():
         }
     }
 
-@app.post("/api/generate/description")
-async def generate_description(listing: ListingDetails):
-    """Generate AI listing description"""
-    description = await generate_description_with_claude(listing)
-    return {"description": description}
-
-@app.post("/api/generate/social")
-async def generate_social(listing: ListingDetails):
-    """Generate social media posts"""
-    description = await generate_description_with_claude(listing)
-    posts = await generate_social_posts_with_claude(listing, description)
-    return {"social_posts": posts}
-
 @app.post("/api/jobs/create")
 async def create_job(
     background_tasks: BackgroundTasks,
@@ -551,16 +512,13 @@ async def create_job(
 ):
     """Create a video generation job"""
     
-    # Parse listing
     listing_data = json.loads(listing_json)
     listing = ListingDetails(**listing_data)
     
-    # Create job directory
     job_id = str(uuid.uuid4())
     job_dir = UPLOAD_DIR / job_id
     job_dir.mkdir(exist_ok=True)
     
-    # Save uploaded photos
     image_paths = []
     for i, photo in enumerate(photos):
         ext = Path(photo.filename).suffix or ".jpg"
@@ -570,7 +528,6 @@ async def create_job(
             f.write(content)
         image_paths.append(str(file_path))
     
-    # Initialize job
     jobs[job_id] = {
         "job_id": job_id,
         "status": "queued",
@@ -583,7 +540,6 @@ async def create_job(
         "listing": listing_data
     }
     
-    # Start processing
     background_tasks.add_task(process_listing_job, job_id, listing, image_paths)
     
     return {"job_id": job_id, "status": "queued"}
@@ -597,9 +553,9 @@ async def get_job(job_id: str):
 
 @app.post("/api/demo/generate")
 async def demo_generate(listing: ListingDetails):
-    """Demo endpoint - text generation only (no video)"""
+    """Demo endpoint - text generation only"""
     description = await generate_description_with_claude(listing)
-    social_posts = await generate_social_posts_with_claude(listing, description)
+    social_posts = await generate_social_posts_with_claude(listing)
     
     return {
         "description": description,
@@ -608,8 +564,7 @@ async def demo_generate(listing: ListingDetails):
             "vertical": {"status": "demo", "url": None},
             "square": {"status": "demo", "url": None},
             "landscape": {"status": "demo", "url": None}
-        },
-        "message": "Demo mode - text generated, videos require full API"
+        }
     }
 
 # ═══════════════════════════════════════════════════════════════
